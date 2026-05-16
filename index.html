@@ -430,6 +430,47 @@ function extractJson(text) {
   return JSON.parse(match[0]);
 }
 
+function extractGrantsFromHtml(html) {
+  // Grants.gov React app embeds initial state in a script tag
+  const hits = [];
+
+  // Try to find embedded JSON state
+  const jsonMatches = html.match(/"oppHits"\s*:\s*(\[[\s\S]*?\])(?=\s*[,}])/);
+  if (jsonMatches) {
+    try {
+      const arr = JSON.parse(jsonMatches[1]);
+      arr.forEach(o => {
+        hits.push({
+          id: o.id || o.oppId || '',
+          title: o.title || o.opportunityTitle || '',
+          number: o.number || o.opportunityNumber || '',
+          agencyName: o.agencyName || o.agency || '',
+          agency: o.agency || '',
+          openDate: o.openDate || o.postedDate || '',
+          closeDate: o.closeDate || o.closingDate || '',
+          oppStatus: o.oppStatus || o.opportunityStatus || ''
+        });
+      });
+    } catch (e) { /* fall through */ }
+  }
+
+  // Fallback: regex-extract from rendered HTML (works for static-rendered results)
+  if (hits.length === 0) {
+    const cardRegex = /<a[^>]+href="\/search-results-detail\/(\d+)"[^>]*>([\s\S]*?)<\/a>/gi;
+    let m;
+    while ((m = cardRegex.exec(html)) !== null && hits.length < 25) {
+      const titleMatch = m[2].match(/>([^<]{10,})</);
+      hits.push({
+        id: m[1],
+        title: (titleMatch ? titleMatch[1] : 'Untitled').trim(),
+        number: '', agencyName: '', agency: '', openDate: '', closeDate: '', oppStatus: ''
+      });
+    }
+  }
+
+  return hits;
+}
+
 // === Tabs ===
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
@@ -486,40 +527,23 @@ async function doSearch() {
   resultsEl.innerHTML = '';
 
   try {
-    // Use Grants.gov search1 GET endpoint via allorigins raw proxy (GET supports CORS better than POST)
-    const grantsUrl = 'https://www.grants.gov/grantsws/rest/opportunities/search/?keyword=' + encodeURIComponent(keyword) + '&oppStatuses=forecasted%7Cposted&rows=25';
-    const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(grantsUrl);
+    // Strategy: scrape the public Grants.gov search results page through allorigins
+    // (proven to work since Ingest uses this proxy successfully)
+    const searchPageUrl = 'https://www.grants.gov/search-grants?keywords=' + encodeURIComponent(keyword) + '&oppStatuses=forecasted%7Cposted';
+    const proxyUrl = 'https://api.allorigins.win/get?url=' + encodeURIComponent(searchPageUrl);
 
-    let data = null;
-    let lastError = null;
+    const res = await fetch(proxyUrl);
+    if (!res.ok) throw new Error('Proxy returned ' + res.status);
+    const wrapped = await res.json();
+    const html = wrapped.contents || '';
+    if (html.length < 500) throw new Error('Empty response from Grants.gov');
 
-    // Attempt 1: allorigins raw proxy (most reliable for cross-origin GETs)
-    try {
-      const res = await fetch(proxyUrl);
-      data = await res.json();
-    } catch (e1) { lastError = e1; }
-
-    // Attempt 2: allorigins get wrapper (returns content-as-string)
-    if (!data) {
-      try {
-        const wrapUrl = 'https://api.allorigins.win/get?url=' + encodeURIComponent(grantsUrl);
-        const res = await fetch(wrapUrl);
-        const wrapped = await res.json();
-        data = JSON.parse(wrapped.contents);
-      } catch (e2) { lastError = e2; }
+    // Try to extract embedded JSON from the React app's initial state
+    const hits = extractGrantsFromHtml(html);
+    if (hits.length === 0) {
+      // Fallback: provide manual workaround
+      throw new Error('No structured results parsed. Try: open ' + searchPageUrl + ' in a new tab, copy a grant URL, paste it into Pipeline > Quick Add.');
     }
-
-    // Attempt 3: corsproxy.io
-    if (!data) {
-      try {
-        const res = await fetch('https://corsproxy.io/?' + encodeURIComponent(grantsUrl));
-        data = await res.json();
-      } catch (e3) { lastError = e3; }
-    }
-
-    if (!data) throw lastError || new Error('All proxies failed');
-
-    const hits = (data && data.data && data.data.oppHits) || (data && data.oppHits) || [];
     statusEl.textContent = hits.length + ' opportunities (forecasted + posted) match "' + keyword + '"';
 
     if (hits.length === 0) {
@@ -550,7 +574,20 @@ async function doSearch() {
     }).join('');
   } catch (e) {
     statusEl.textContent = '';
-    resultsEl.innerHTML = `<div class="empty-state">Search failed: ${escapeHtml(e.message)}. Grants.gov API may be down or your network is blocking it.</div>`;
+    const fallbackUrl = 'https://www.grants.gov/search-grants?keywords=' + encodeURIComponent(keyword);
+    resultsEl.innerHTML = `<div class="empty-state">
+      <div style="color:#c89a3c;font-size:14px;margin-bottom:14px;">Live search hit an error: ${escapeHtml(e.message)}</div>
+      <div style="font-size:13px;color:#a89c80;line-height:1.7;margin-bottom:18px;">No problem — use the manual workflow below. Always works.</div>
+      <a class="btn btn-solid" href="${escapeAttr(fallbackUrl)}" target="_blank" rel="noopener" style="display:inline-block;margin-bottom:14px;padding:12px 20px;">↗ Open Grants.gov Search for "${escapeHtml(keyword)}"</a>
+      <div style="font-size:12px;color:#8b7355;line-height:1.7;text-align:left;max-width:520px;margin:14px auto 0;">
+        <strong style="color:#c89a3c;">Manual workflow (works for any grant site):</strong><br>
+        1. Click the button above (opens Grants.gov in a new tab)<br>
+        2. Browse the results, click into any grant you like<br>
+        3. Copy the URL from your browser's address bar<br>
+        4. Come back here → tab 02 · Pipeline → paste URL into "Quick Add by URL"<br>
+        5. With AI enabled, click Ingest to auto-extract details
+      </div>
+    </div>`;
   }
 }
 
