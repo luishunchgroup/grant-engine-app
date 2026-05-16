@@ -486,29 +486,40 @@ async function doSearch() {
   resultsEl.innerHTML = '';
 
   try {
-    // Route through allorigins proxy because Grants.gov API doesn't send CORS headers
-    const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://api.grants.gov/v1/api/search2');
-    const apiBody = JSON.stringify({ keyword: keyword, oppStatuses: 'forecasted|posted', rows: 25 });
+    // Use Grants.gov search1 GET endpoint via allorigins raw proxy (GET supports CORS better than POST)
+    const grantsUrl = 'https://www.grants.gov/grantsws/rest/opportunities/search/?keyword=' + encodeURIComponent(keyword) + '&oppStatuses=forecasted%7Cposted&rows=25';
+    const proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent(grantsUrl);
 
-    let data;
+    let data = null;
+    let lastError = null;
+
+    // Attempt 1: allorigins raw proxy (most reliable for cross-origin GETs)
     try {
-      // Try POST through proxy first
-      const res = await fetch(proxyUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: apiBody
-      });
+      const res = await fetch(proxyUrl);
       data = await res.json();
-    } catch (proxyErr) {
-      // Fallback: try direct (may work in some browsers)
-      const res = await fetch('https://api.grants.gov/v1/api/search2', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: apiBody
-      });
-      data = await res.json();
+    } catch (e1) { lastError = e1; }
+
+    // Attempt 2: allorigins get wrapper (returns content-as-string)
+    if (!data) {
+      try {
+        const wrapUrl = 'https://api.allorigins.win/get?url=' + encodeURIComponent(grantsUrl);
+        const res = await fetch(wrapUrl);
+        const wrapped = await res.json();
+        data = JSON.parse(wrapped.contents);
+      } catch (e2) { lastError = e2; }
     }
-    const hits = (data && data.data && data.data.oppHits) || [];
+
+    // Attempt 3: corsproxy.io
+    if (!data) {
+      try {
+        const res = await fetch('https://corsproxy.io/?' + encodeURIComponent(grantsUrl));
+        data = await res.json();
+      } catch (e3) { lastError = e3; }
+    }
+
+    if (!data) throw lastError || new Error('All proxies failed');
+
+    const hits = (data && data.data && data.data.oppHits) || (data && data.oppHits) || [];
     statusEl.textContent = hits.length + ' opportunities (forecasted + posted) match "' + keyword + '"';
 
     if (hits.length === 0) {
